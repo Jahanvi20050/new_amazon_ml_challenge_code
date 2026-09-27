@@ -121,15 +121,16 @@ def calibrate_threshold(
 
 
 def export_matching_results_tsv(predictions_dict: dict, s1_all_ids: list, output_filepath: str):
-    """Save output/matching_results.tsv with columns [source1_entity_id, matched_entity_ids]."""
+    """Save output/matching_results.tsv with columns [source1_entity_id, matched_entity_ids]. Only includes rows with non-empty matches."""
     os.makedirs(os.path.dirname(output_filepath), exist_ok=True)
     with open(output_filepath, 'w', encoding='utf-8', newline='') as f:
         writer = csv.writer(f, delimiter='\t')
         writer.writerow(['source1_entity_id', 'matched_entity_ids'])
         for s1_id in s1_all_ids:
             matched_set = predictions_dict.get(s1_id, set())
-            matched_str = ",".join(sorted(list(matched_set)))
-            writer.writerow([s1_id, matched_str])
+            if matched_set:
+                matched_str = ",".join(sorted(list(matched_set)))
+                writer.writerow([s1_id, matched_str])
     print(f"[Export] Saved matching results to {output_filepath}")
 
 
