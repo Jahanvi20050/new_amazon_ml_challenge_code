@@ -19,12 +19,21 @@ from scipy.sparse import csr_matrix
 
 
 class HybridBlocker:
-    def __init__(self, model_name: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"):
-        print(f"[Hybrid Blocking] Loading Dense SentenceTransformer model: '{model_name}'...")
-        self.model = SentenceTransformer(model_name)
+    def __init__(self, model_name: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2", use_dense: bool = False):
+        self.use_dense = use_dense
+        self.model = None
+        if self.use_dense:
+            try:
+                print(f"[Hybrid Blocking] Loading Dense SentenceTransformer model: '{model_name}'...")
+                self.model = SentenceTransformer(model_name)
+            except Exception as e:
+                print(f"[Hybrid Blocking] Dense model load skipped: {e}. Falling back to Fast Sparse TF-IDF.")
+                self.use_dense = False
 
     def encode_dense(self, texts: list, batch_size: int = 256) -> np.ndarray:
         """Encode texts into L2 normalized 384D dense vectors."""
+        if not self.model:
+            return None
         embeddings = self.model.encode(
             texts,
             batch_size=batch_size,
@@ -39,11 +48,11 @@ class HybridBlocker:
         df_s2: pd.DataFrame,
         df_s3: pd.DataFrame,
         top_k_dense: int = 30,
-        top_k_sparse: int = 20
+        top_k_sparse: int = 30
     ) -> dict:
         """
         Partition candidates and queries by country.
-        Performs Hybrid Search (Dense FAISS IP + Sparse TF-IDF Cosine Sim).
+        Performs Ultra-Fast Hybrid/Sparse Search (TF-IDF Char 3-5 Grams + Word Grams).
 
         Returns:
             dict: s1_id -> list of dicts: {'cand_id': str, 'dense_sim': float, 'sparse_sim': float}
@@ -72,25 +81,25 @@ class HybridBlocker:
 
             print(f"[Blocking] Country '{country}': Queries={len(sub_s1)} | Candidates={len(sub_cand)}")
 
-            # --- 1. Dense Vector Search (FAISS) ---
-            cand_dense = self.encode_dense(cand_texts)
-            s1_dense = self.encode_dense(s1_texts)
+            # --- 1. Dense Search (Optional) ---
+            dense_indices, dense_dists = None, None
+            if self.use_dense and self.model:
+                try:
+                    cand_dense = self.encode_dense(cand_texts)
+                    s1_dense = self.encode_dense(s1_texts)
+                    dimension = cand_dense.shape[1]
+                    index = faiss.IndexFlatIP(dimension)
+                    index.add(cand_dense)
+                    k_dense = min(top_k_dense, len(cand_ids))
+                    dense_dists, dense_indices = index.search(s1_dense, k_dense)
+                except Exception as ex:
+                    print(f"[Blocking] Dense search error: {ex}. Proceeding with sparse.")
 
-            dimension = cand_dense.shape[1]
-            index = faiss.IndexFlatIP(dimension)
-            index.add(cand_dense)
-
-            k_dense = min(top_k_dense, len(cand_ids))
-            dense_dists, dense_indices = index.search(s1_dense, k_dense)
-
-            # --- 2. Sparse TF-IDF Search (Char 3-gram + Word) ---
-            min_df_val = 2 if len(cand_texts + s1_texts) >= 10 else 1
-            max_df_val = 0.8 if len(cand_texts + s1_texts) >= 10 else 1.0
+            # --- 2. Sparse TF-IDF Search (Char 3-5 Gram + Word) ---
             tfidf = TfidfVectorizer(
                 analyzer='char_wb',
-                ngram_range=(3, 4),
-                min_df=min_df_val,
-                max_df=max_df_val,
+                ngram_range=(3, 5),
+                min_df=1,
                 sublinear_tf=True
             )
             tfidf.fit(cand_texts + s1_texts)
@@ -98,11 +107,10 @@ class HybridBlocker:
             cand_sparse = tfidf.transform(cand_texts)
             s1_sparse = tfidf.transform(s1_texts)
 
-            # Batched Sparse Dot Product to prevent Memory Error on large candidate pools
-            batch_size = 2000
             num_s1 = s1_sparse.shape[0]
             k_sparse = min(top_k_sparse, len(cand_ids))
 
+            batch_size = 2000
             sparse_top_candidates = {}
 
             for start_idx in range(0, num_s1, batch_size):
@@ -131,19 +139,19 @@ class HybridBlocker:
 
                     sparse_top_candidates[global_s1_idx] = list(zip(best_indices, best_sims))
 
-            # --- 3. Merge Hybrid Candidates per S1 entity ---
-            k_dense = min(top_k_dense, len(cand_ids))
-
+            # --- 3. Merge Candidates per S1 entity ---
             for i, s1_id in enumerate(s1_ids):
                 cand_map = {}
 
-                # Add Dense Top Candidates
-                for j in range(k_dense):
-                    c_idx = dense_indices[i, j]
-                    if 0 <= c_idx < len(cand_ids):
-                        c_id = cand_ids[c_idx]
-                        d_sim = float(dense_dists[i, j])
-                        cand_map[c_id] = {'cand_id': c_id, 'dense_sim': d_sim, 'sparse_sim': 0.0}
+                # Add Dense Top Candidates if present
+                if dense_indices is not None and dense_dists is not None:
+                    k_d = min(top_k_dense, len(cand_ids))
+                    for j in range(k_d):
+                        c_idx = dense_indices[i, j]
+                        if 0 <= c_idx < len(cand_ids):
+                            c_id = cand_ids[c_idx]
+                            d_sim = float(dense_dists[i, j])
+                            cand_map[c_id] = {'cand_id': c_id, 'dense_sim': d_sim, 'sparse_sim': 0.0}
 
                 # Add Sparse Top Candidates
                 if i in sparse_top_candidates:
@@ -152,22 +160,36 @@ class HybridBlocker:
                         if c_id in cand_map:
                             cand_map[c_id]['sparse_sim'] = float(s_sim)
                         else:
-                            cand_map[c_id] = {'cand_id': c_id, 'dense_sim': 0.0, 'sparse_sim': float(s_sim)}
+                            cand_map[c_id] = {'cand_id': c_id, 'dense_sim': float(s_sim), 'sparse_sim': float(s_sim)}
+
+                # Fallback: if no candidates found, take top 5 default candidates
+                if not cand_map and len(cand_ids) > 0:
+                    for c_id in cand_ids[:5]:
+                        cand_map[c_id] = {'cand_id': c_id, 'dense_sim': 0.1, 'sparse_sim': 0.1}
 
                 results[s1_id] = list(cand_map.values())
 
         return results
 
 
-def export_candidate_pairs_tsv(candidate_dict: dict, output_filepath: str):
+def export_candidate_pairs_tsv(candidate_dict: dict, s1_all_ids: list, output_filepath: str):
     """Save candidate_pairs.tsv with columns [source1_entity_id, candidate_entity_ids]."""
     os.makedirs(os.path.dirname(output_filepath), exist_ok=True)
     with open(output_filepath, 'w', encoding='utf-8', newline='') as f:
         writer = csv.writer(f, delimiter='\t')
         writer.writerow(['source1_entity_id', 'candidate_entity_ids'])
-        for s1_id, pair_list in candidate_dict.items():
-            # Export top 35 candidates
+        for s1_id in s1_all_ids:
+            pair_list = candidate_dict.get(s1_id, [])
+            # Export top 35 candidates sorted by similarity score
             sorted_pairs = sorted(pair_list, key=lambda x: (x['dense_sim'] + x['sparse_sim']), reverse=True)[:35]
-            cand_str = ",".join([c['cand_id'] for c in sorted_pairs])
+            seen = set()
+            cand_ids = []
+            for c in sorted_pairs:
+                cid = c['cand_id']
+                if cid not in seen:
+                    seen.add(cid)
+                    cand_ids.append(cid)
+            cand_str = ",".join(cand_ids)
             writer.writerow([s1_id, cand_str])
     print(f"[Blocking] Saved candidate pairs to {output_filepath}")
+

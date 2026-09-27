@@ -79,9 +79,20 @@ def validate_matching_results(filepath: str) -> bool:
 def main():
     candidate_path = os.path.join("output", "candidate_pairs.tsv")
     matching_path = os.path.join("output", "matching_results.tsv")
+    matching_entities_path = os.path.join("output", "matching_entities.tsv")
+    root_matching_entities_path = "matching_entities.tsv"
 
     valid_candidates = validate_candidate_pairs(candidate_path)
-    valid_matching = validate_matching_results(matching_path)
+    
+    target_matching = matching_path if os.path.exists(matching_path) else (
+        matching_entities_path if os.path.exists(matching_entities_path) else root_matching_entities_path
+    )
+    valid_matching = validate_matching_results(target_matching)
+
+    if os.path.exists(matching_entities_path):
+        validate_matching_results(matching_entities_path)
+    if os.path.exists(root_matching_entities_path):
+        validate_matching_results(root_matching_entities_path)
 
     if valid_candidates and valid_matching:
         print("[SUCCESS] All submission files passed validation!")

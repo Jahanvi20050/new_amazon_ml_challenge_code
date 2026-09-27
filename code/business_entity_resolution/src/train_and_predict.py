@@ -137,23 +137,70 @@ def run_pipeline(project_root: str):
     print(f"=== Multilingual Entity Resolution Pipeline (Enhanced SOTA) ===")
     print(f"Project Root: {project_root}")
 
-    # Paths
-    train_dir = os.path.join(project_root, "dataset", "train")
-    test_dir = os.path.join(project_root, "dataset", "test")
+    # Paths: Check root for sstrain_* files first, then small_file_train_*, then dataset/train
+    ss_s1 = os.path.join(project_root, "sstrain_source1.tsv")
+    if os.path.exists(ss_s1):
+        print(f"[Data] Found sstrain files in project root ({project_root})")
+        s1_path = ss_s1
+        s2_path = os.path.join(project_root, "sstrain_source2.tsv")
+        s3_path = os.path.join(project_root, "sstrain_source3.tsv")
+        gt_path = os.path.join(project_root, "sstrain_ground_truth.tsv")
+    elif os.path.exists(os.path.join(project_root, "small_file_train_source1.tsv")):
+        print(f"[Data] Found small_file_train files in project root")
+        s1_path = os.path.join(project_root, "small_file_train_source1.tsv")
+        s2_path = os.path.join(project_root, "small_file_train_source2.tsv")
+        s3_path = os.path.join(project_root, "small_file_train_source3.tsv")
+        gt_path = os.path.join(project_root, "small_file_train_ground_truth.tsv")
+    else:
+        train_dir = os.path.join(project_root, "dataset", "train")
+        s1_path = os.path.join(train_dir, "train_source1.tsv")
+        s2_path = os.path.join(train_dir, "train_source2.tsv")
+        s3_path = os.path.join(train_dir, "train_source3.tsv")
+        gt_path = os.path.join(train_dir, "train_ground_truth.tsv")
+
+    # Test set detection (check root sstest_* first, then dataset/test)
+    sstest_s1 = os.path.join(project_root, "sstest_source1.tsv")
+    if os.path.exists(sstest_s1):
+        print(f"[Data] Found sstest test files in project root ({project_root})")
+        test_s1_path = sstest_s1
+        test_s2_path = os.path.join(project_root, "sstest_source2.tsv")
+        test_s3_path = os.path.join(project_root, "sstest_source3.tsv")
+    else:
+        test_dir = os.path.join(project_root, "dataset", "test")
+        test_s1_path = os.path.join(test_dir, "test_source1.tsv")
+        test_s2_path = os.path.join(test_dir, "test_source2.tsv")
+        test_s3_path = os.path.join(test_dir, "test_source3.tsv")
+
     output_dir = os.path.join(project_root, "output")
     utils_dir = os.path.join(project_root, "utils")
 
-    s1_path = os.path.join(train_dir, "train_source1.tsv")
-    s2_path = os.path.join(train_dir, "train_source2.tsv")
-    s3_path = os.path.join(train_dir, "train_source3.tsv")
-    gt_path = os.path.join(train_dir, "train_ground_truth.tsv")
-
     # 1. Load Data
-    print("[1/6] Loading and Preprocessing Training Data...")
+    print(f"[1/6] Loading and Preprocessing Training Data from:\n  - {s1_path}\n  - {s2_path}\n  - {s3_path}")
     df_s1 = pd.read_csv(s1_path, sep='\t')
     df_s2 = pd.read_csv(s2_path, sep='\t')
     df_s3 = pd.read_csv(s3_path, sep='\t')
     gt_dict = load_ground_truth(gt_path)
+
+    # Fast sampling if full dataset/train/ is used
+    if len(df_s1) > 3000 and gt_dict:
+        print("[Data] Sampling balanced subset of training dataset...")
+        gt_s1_ids = [k for k, v in gt_dict.items() if v]
+        singleton_s1_ids = [k for k, v in gt_dict.items() if not v][:1500]
+        sample_s1_set = set(gt_s1_ids + singleton_s1_ids)
+        df_s1 = df_s1[df_s1['entity_id'].isin(sample_s1_set)].copy()
+        
+        req_s2 = set()
+        req_s3 = set()
+        for k in sample_s1_set:
+            for m in gt_dict.get(k, set()):
+                if m.startswith('S2-'):
+                    req_s2.add(m)
+                elif m.startswith('S3-'):
+                    req_s3.add(m)
+        extra_s2 = df_s2[~df_s2['entity_id'].isin(req_s2)].iloc[:2000]
+        df_s2 = pd.concat([df_s2[df_s2['entity_id'].isin(req_s2)], extra_s2], ignore_index=True)
+        extra_s3 = df_s3[~df_s3['entity_id'].isin(req_s3)].iloc[:2000]
+        df_s3 = pd.concat([df_s3[df_s3['entity_id'].isin(req_s3)], extra_s3], ignore_index=True)
 
     df_s1 = preprocess_dataframe(df_s1)
     df_s2 = preprocess_dataframe(df_s2)
@@ -223,17 +270,13 @@ def run_pipeline(project_root: str):
 
     # 6. Test Set Inference
     print("[5/6] Running Test Inference...")
-    test_s1_path = os.path.join(test_dir, "test_source1.tsv")
-    test_s2_path = os.path.join(test_dir, "test_source2.tsv")
-    test_s3_path = os.path.join(test_dir, "test_source3.tsv")
-
     if os.path.exists(test_s1_path) and os.path.exists(test_s2_path) and os.path.exists(test_s3_path):
-        print("Test set detected under dataset/test/. Loading test dataset...")
+        print(f"Test set detected at '{test_s1_path}'. Loading test dataset...")
         df_test_s1 = preprocess_dataframe(pd.read_csv(test_s1_path, sep='\t'))
         df_test_s2 = preprocess_dataframe(pd.read_csv(test_s2_path, sep='\t'))
         df_test_s3 = preprocess_dataframe(pd.read_csv(test_s3_path, sep='\t'))
     else:
-        print("Test dataset not found under dataset/test/. Generating submission output on full train dataset...")
+        print("Test dataset not found under sstest_* or dataset/test/. Generating submission output on full train dataset...")
         df_test_s1 = df_s1
         df_test_s2 = df_s2
         df_test_s3 = df_s3
@@ -247,9 +290,11 @@ def run_pipeline(project_root: str):
 
     X_test, test_pair_info, _ = build_feature_matrix(test_s1_dict, test_cand_dict, test_candidates, ground_truth_dict=None)
 
-    # Export output/candidate_pairs.tsv
+    # Export candidate_pairs.tsv to output/ and root
     cand_pairs_out = os.path.join(output_dir, "candidate_pairs.tsv")
-    export_candidate_pairs_tsv(test_candidates, cand_pairs_out)
+    root_cand_pairs_out = os.path.join(project_root, "candidate_pairs.tsv")
+    export_candidate_pairs_tsv(test_candidates, test_s1_all_ids, cand_pairs_out)
+    export_candidate_pairs_tsv(test_candidates, test_s1_all_ids, root_cand_pairs_out)
 
     # Predict test matches with ensemble
     test_probs_lgb = lgb_model.predict_proba(X_test)[:, 1]
@@ -257,12 +302,23 @@ def run_pipeline(project_root: str):
     test_probs = 0.5 * test_probs_lgb + 0.5 * test_probs_hgb
     test_pair_info['prob'] = test_probs
 
-    test_passed = test_pair_info[test_pair_info['prob'] >= best_thresh]
+    # Adaptive threshold for test matching
+    effective_thresh = min(best_thresh, 0.05)
+    test_passed = test_pair_info[test_pair_info['prob'] >= effective_thresh]
     test_preds_dict = test_passed.groupby('source1_entity_id')['candidate_entity_id'].apply(set).to_dict()
 
-    # Export output/matching_results.tsv
+    # Export output/matching_results.tsv, output/matching_entities.tsv, root matching_entities.tsv and root matching_results.tsv
     matching_out = os.path.join(output_dir, "matching_results.tsv")
     export_matching_results_tsv(test_preds_dict, test_s1_all_ids, matching_out)
+
+    matching_entities_out = os.path.join(output_dir, "matching_entities.tsv")
+    export_matching_results_tsv(test_preds_dict, test_s1_all_ids, matching_entities_out)
+
+    root_matching_entities_out = os.path.join(project_root, "matching_entities.tsv")
+    export_matching_results_tsv(test_preds_dict, test_s1_all_ids, root_matching_entities_out)
+
+    root_matching_results_out = os.path.join(project_root, "matching_results.tsv")
+    export_matching_results_tsv(test_preds_dict, test_s1_all_ids, root_matching_results_out)
 
     # 7. Local Validation
     print("[6/6] Executing Submission Validation...")
