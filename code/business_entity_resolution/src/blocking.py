@@ -84,17 +84,55 @@ class HybridBlocker:
             dense_dists, dense_indices = index.search(s1_dense, k_dense)
 
             # --- 2. Sparse TF-IDF Search (Char 3-gram + Word) ---
-            tfidf = TfidfVectorizer(analyzer='char_wb', ngram_range=(3, 4), min_df=1)
+            min_df_val = 2 if len(cand_texts + s1_texts) >= 10 else 1
+            max_df_val = 0.8 if len(cand_texts + s1_texts) >= 10 else 1.0
+            tfidf = TfidfVectorizer(
+                analyzer='char_wb',
+                ngram_range=(3, 4),
+                min_df=min_df_val,
+                max_df=max_df_val,
+                sublinear_tf=True
+            )
             tfidf.fit(cand_texts + s1_texts)
 
             cand_sparse = tfidf.transform(cand_texts)
             s1_sparse = tfidf.transform(s1_texts)
 
-            # Compute Sparse Dot Product (Cosine Similarity because rows are L2 normalized by TfidfVectorizer)
-            sparse_sim_matrix = s1_sparse.dot(cand_sparse.T)
+            # Batched Sparse Dot Product to prevent Memory Error on large candidate pools
+            batch_size = 2000
+            num_s1 = s1_sparse.shape[0]
+            k_sparse = min(top_k_sparse, len(cand_ids))
+
+            sparse_top_candidates = {}
+
+            for start_idx in range(0, num_s1, batch_size):
+                end_idx = min(start_idx + batch_size, num_s1)
+                s1_batch = s1_sparse[start_idx:end_idx]
+                batch_sim = s1_batch.dot(cand_sparse.T)
+
+                for r in range(batch_sim.shape[0]):
+                    global_s1_idx = start_idx + r
+                    row = batch_sim[r]
+                    if row.nnz == 0:
+                        continue
+
+                    indices = row.indices
+                    data = row.data
+
+                    if len(data) > k_sparse:
+                        top_k_local = np.argpartition(data, -k_sparse)[-k_sparse:]
+                        top_k_local = top_k_local[np.argsort(-data[top_k_local])]
+                        best_indices = indices[top_k_local]
+                        best_sims = data[top_k_local]
+                    else:
+                        sort_order = np.argsort(-data)
+                        best_indices = indices[sort_order]
+                        best_sims = data[sort_order]
+
+                    sparse_top_candidates[global_s1_idx] = list(zip(best_indices, best_sims))
 
             # --- 3. Merge Hybrid Candidates per S1 entity ---
-            k_sparse = min(top_k_sparse, len(cand_ids))
+            k_dense = min(top_k_dense, len(cand_ids))
 
             for i, s1_id in enumerate(s1_ids):
                 cand_map = {}
@@ -108,19 +146,13 @@ class HybridBlocker:
                         cand_map[c_id] = {'cand_id': c_id, 'dense_sim': d_sim, 'sparse_sim': 0.0}
 
                 # Add Sparse Top Candidates
-                row_sparse = sparse_sim_matrix[i].toarray().ravel()
-                if len(row_sparse) > 0:
-                    top_sparse_idxs = np.argpartition(row_sparse, -k_sparse)[-k_sparse:]
-                    top_sparse_idxs = top_sparse_idxs[np.argsort(-row_sparse[top_sparse_idxs])]
-
-                    for c_idx in top_sparse_idxs:
+                if i in sparse_top_candidates:
+                    for c_idx, s_sim in sparse_top_candidates[i]:
                         c_id = cand_ids[c_idx]
-                        s_sim = float(row_sparse[c_idx])
                         if c_id in cand_map:
-                            cand_map[c_id]['sparse_sim'] = s_sim
+                            cand_map[c_id]['sparse_sim'] = float(s_sim)
                         else:
-                            # Dense sim fallback
-                            cand_map[c_id] = {'cand_id': c_id, 'dense_sim': 0.0, 'sparse_sim': s_sim}
+                            cand_map[c_id] = {'cand_id': c_id, 'dense_sim': 0.0, 'sparse_sim': float(s_sim)}
 
                 results[s1_id] = list(cand_map.values())
 
